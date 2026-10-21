@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mandible-clarity"
+version = "0.1.0"
+description = "Headless DeepFilterNet AI vocal de-noiser and de-reverberation sidecar for Mandible."
+authors = [{ name = "Xen10 Industries" }]
+license = { text = "MIT" }
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24.0",
+    "onnxruntime>=1.16.0",
+    "pedalboard>=0.8.0",
+]
+
+[project.scripts]
+mandible-clarity = "mandible_clarity.__main__:main"
