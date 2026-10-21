@@ -1,7 +1,6 @@
-"""Core AI enhancement engine, ERB spectral filtering, and ONNX Runtime inference."""
+"""Core AI enhancement engine: DeepFilterNet3 ONNX neural inference & Decision-Directed spectral filtering."""
 from __future__ import annotations
 
-import json
 import math
 import os
 import sys
@@ -9,11 +8,6 @@ from dataclasses import dataclass
 from typing import Callable
 
 import numpy as np
-
-try:
-    import pedalboard.io
-except ImportError:
-    pedalboard = None
 
 
 @dataclass
@@ -27,8 +21,7 @@ class HardwareInfo:
 
 def detect_hardware() -> HardwareInfo:
     """Detect available hardware accelerator and ONNX execution providers."""
-    providers: list[str] = []
-    backend = "NumPy High-Resolution ERB Filter"
+    backend = "NumPy Decision-Directed ERB Engine"
     has_cuda = False
     has_dml = False
     gpu_name = ""
@@ -47,8 +40,8 @@ def detect_hardware() -> HardwareInfo:
     except Exception:
         pass
 
-    # Try detecting GPU model name via nvidia-smi
-    if has_cuda or sys.platform == "win32":
+    # Detect GPU model name via nvidia-smi
+    if sys.platform == "win32":
         try:
             import subprocess
             res = subprocess.run(
@@ -74,74 +67,121 @@ def detect_hardware() -> HardwareInfo:
 
 
 class ClarityEngine:
-    """DeepFilterNet / ERB multi-band spectral speech enhancement & dereverberation processor."""
+    """DeepFilterNet3 neural voice cleaner and dereverberation processor.
 
-    FRAME_SIZE: int = 480       # 10 ms at 48 kHz
-    HOP_SIZE: int = 240         # 5 ms 50% overlap
+    Operates at 48 kHz with 960-sample STFT (20 ms) and 480-sample hop (10 ms).
+    Uses periodic square-root Hann window for exact Constant Overlap-Add (COLA)
+    with zero amplitude modulation or buzzing distortion.
+    """
+
+    FRAME_SIZE: int = 960       # 20 ms at 48 kHz
+    HOP_SIZE: int = 480         # 10 ms at 48 kHz (50% overlap)
     SAMPLE_RATE: int = 48000
-    NUM_ERB_BANDS: int = 32
+    NUM_ERB: int = 32
 
     def __init__(
         self,
         sample_rate: int = 48000,
-        model_path: str | None = None,
+        model_dir: str | None = None,
         atten_limit_db: float = 35.0,
         dereverb: bool = True,
     ):
         self.sample_rate = sample_rate
         self.atten_limit_db = atten_limit_db
         self.dereverb = dereverb
-        self.model_path = model_path
-        self.session = None
+        self.model_dir = model_dir or self._default_weights_dir()
 
-        # Noise floor tracking and spectral envelope buffers
-        self._noise_est = np.ones(self.FRAME_SIZE // 2 + 1, dtype=np.float32) * 1e-4
-        self._alpha_noise = 0.95
-        self._reverb_est = np.zeros(self.FRAME_SIZE // 2 + 1, dtype=np.float32)
+        self.sess_enc = None
+        self.sess_erb = None
 
-        # STFT overlap-add window (Hann window with constant-overlap-add property)
-        self._window = np.hanning(self.FRAME_SIZE).astype(np.float32)
+        # Exact COLA periodic sqrt-Hann window
+        n = np.arange(self.FRAME_SIZE, dtype=np.float32)
+        hann = 0.5 * (1.0 - np.cos(2.0 * np.pi * n / self.FRAME_SIZE))
+        self._window = np.sqrt(np.maximum(hann, 0.0)).astype(np.float32)
+
         self._in_buffer = np.zeros(self.FRAME_SIZE, dtype=np.float32)
         self._out_buffer = np.zeros(self.FRAME_SIZE, dtype=np.float32)
 
-        # Precompute ERB filterbank indices
-        self._erb_indices = self._calc_erb_indices(self.sample_rate, self.FRAME_SIZE, self.NUM_ERB_BANDS)
+        n_bins = self.FRAME_SIZE // 2 + 1
+        self._noise_psd = np.ones(n_bins, dtype=np.float32) * 1e-4
+        self._prior_speech = np.zeros(n_bins, dtype=np.float32)
+        self._reverb_tail = np.zeros(n_bins, dtype=np.float32)
 
-        self._init_model()
+        # Normalization states for DeepFilterNet3
+        self._erb_state = np.linspace(-60.0, -90.0, self.NUM_ERB, dtype=np.float32)
+        self._spec_state = np.linspace(0.001, 0.0001, 96, dtype=np.float32)
+        self._norm_alpha = 0.95
+        self._calibrated_frames = 0
 
-    def _init_model(self) -> None:
-        """Initialize ONNX Runtime session if model_path is provided and available."""
-        if not self.model_path or not os.path.isfile(self.model_path):
-            return
-
-        try:
-            import onnxruntime as ort
-            providers = ort.get_available_providers()
-            active_providers = [p for p in ["CUDAExecutionProvider", "DmlExecutionProvider", "CPUExecutionProvider"] if p in providers]
-            sess_opts = ort.SessionOptions()
-            sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-            self.session = ort.InferenceSession(self.model_path, sess_options=sess_opts, providers=active_providers)
-        except Exception:
-            self.session = None
+        self._erb_fb, self._inv_erb = self._build_erb_filterbank(self.sample_rate, self.FRAME_SIZE, self.NUM_ERB)
+        self._init_neural_models()
 
     @staticmethod
-    def _calc_erb_indices(sr: int, n_fft: int, num_bands: int) -> list[tuple[int, int]]:
-        """Compute frequency bin slice ranges for Equivalent Rectangular Bandwidth (ERB) bands."""
-        nyquist = sr / 2.0
-        n_bins = n_fft // 2 + 1
-        # Glasberg & Moore (1990) ERB rate scale: 21.4 * log10(4.37 * f/1000 + 1)
-        erb_min = 21.4 * math.log10(4.37 * 20.0 / 1000.0 + 1.0)
-        erb_max = 21.4 * math.log10(4.37 * nyquist / 1000.0 + 1.0)
-        erb_points = np.linspace(erb_min, erb_max, num_bands + 2)
-        freq_points = (10.0 ** (erb_points / 21.4) - 1.0) * 1000.0 / 4.37
-        bin_points = np.clip(np.round(freq_points * n_fft / sr).astype(int), 0, n_bins)
+    def _default_weights_dir() -> str:
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), "weights")
 
-        ranges = []
-        for i in range(num_bands):
-            start = int(bin_points[i])
-            end = max(start + 1, int(bin_points[i + 2]))
-            ranges.append((start, min(end, n_bins)))
-        return ranges
+    def _init_neural_models(self) -> None:
+        """Attempt to load DeepFilterNet3 ONNX models if available."""
+        if not self.model_dir or not os.path.isdir(self.model_dir):
+            return
+
+        enc_path = os.path.join(self.model_dir, "enc.onnx")
+        erb_path = os.path.join(self.model_dir, "erb_dec.onnx")
+
+        if os.path.isfile(enc_path) and os.path.isfile(erb_path):
+            try:
+                import onnxruntime as ort
+                providers = ort.get_available_providers()
+                active = [p for p in ["CUDAExecutionProvider", "DmlExecutionProvider", "CPUExecutionProvider"] if p in providers]
+                opts = ort.SessionOptions()
+                opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+                self.sess_enc = ort.InferenceSession(enc_path, sess_options=opts, providers=active)
+                self.sess_erb = ort.InferenceSession(erb_path, sess_options=opts, providers=active)
+            except Exception:
+                self.sess_enc = None
+                self.sess_erb = None
+
+    @staticmethod
+    def _build_erb_filterbank(sr: int, n_fft: int, nb_erb: int) -> tuple[np.ndarray, np.ndarray]:
+        """Construct forward and inverse ERB filterbanks for 48 kHz audio."""
+        n_bins = n_fft // 2 + 1
+        erb_low = 9.265 * math.log(1.0 + 20.0 / (24.7 * 9.265))
+        erb_high = 9.265 * math.log(1.0 + (sr / 2.0) / (24.7 * 9.265))
+        step = (erb_high - erb_low) / nb_erb
+        freq_width = sr / n_fft
+
+        widths: list[int] = []
+        prev_f = 0
+        for i in range(1, nb_erb + 1):
+            f = 24.7 * 9.265 * (math.exp((erb_low + i * step) / 9.265) - 1.0)
+            fb = int(round(f / freq_width))
+            w = max(1, fb - prev_f)
+            widths.append(w)
+            prev_f = fb
+
+        diff = sum(widths) - n_bins
+        widths[-1] -= diff
+
+        erb_fb = np.zeros((n_bins, nb_erb), dtype=np.float32)
+        inv_erb = np.zeros((nb_erb, n_bins), dtype=np.float32)
+        idx = 0
+        for b, w in enumerate(widths):
+            erb_fb[idx : idx + w, b] = 1.0 / max(1, w)
+            inv_erb[b, idx : idx + w] = 1.0
+            idx += w
+
+        return erb_fb, inv_erb
+
+    def reset(self) -> None:
+        """Clear buffers and reset filter tracking state."""
+        self._in_buffer.fill(0.0)
+        self._out_buffer.fill(0.0)
+        self._noise_psd.fill(1e-4)
+        self._prior_speech.fill(0.0)
+        self._reverb_tail.fill(0.0)
+        self._erb_state = np.linspace(-60.0, -90.0, self.NUM_ERB, dtype=np.float32)
+        self._spec_state = np.linspace(0.001, 0.0001, 96, dtype=np.float32)
+        self._calibrated_frames = 0
 
     def process_chunk(
         self,
@@ -150,7 +190,7 @@ class ClarityEngine:
         atten_limit_db: float | None = None,
         dereverb: bool | None = None,
     ) -> np.ndarray:
-        """Process a block of 48 kHz mono float32 audio."""
+        """Process 1D float32 audio block with DeepFilterNet spectral enhancement."""
         if len(chunk) == 0 or wet <= 0.001:
             return chunk
 
@@ -158,7 +198,6 @@ class ClarityEngine:
         do_dereverb = self.dereverb if dereverb is None else dereverb
         min_gain = 10.0 ** (-float(atten_lim) / 20.0)
 
-        # Work on float32 mono array
         samples = chunk.astype(np.float32, copy=False)
         out = np.zeros_like(samples)
 
@@ -168,42 +207,83 @@ class ClarityEngine:
         n_fft = self.FRAME_SIZE
 
         while pos + hop <= len(samples):
-            # Shift buffer by hop and append new input
             self._in_buffer[:-hop] = self._in_buffer[hop:]
             self._in_buffer[-hop:] = samples[pos : pos + hop]
 
             frame = self._in_buffer * win
             spec = np.fft.rfft(frame)
             mag = np.abs(spec)
+            psd = mag ** 2
             phase = np.angle(spec)
 
-            # Update minimum noise tracking (stationary noise estimator)
-            self._noise_est = np.minimum(self._noise_est * 1.002, np.maximum(mag * 0.05, 1e-6))
-            self._noise_est = self._alpha_noise * self._noise_est + (1.0 - self._alpha_noise) * np.minimum(mag, self._noise_est * 1.5)
+            self._calibrated_frames += 1
+            if self._calibrated_frames < 20:
+                self._noise_psd = 0.8 * self._noise_psd + 0.2 * psd
+                gain = np.ones_like(mag) * min_gain
+            else:
+                gain = None
 
-            # Calculate SNR and Wiener suppression gains
-            snr = (mag ** 2) / np.maximum(self._noise_est ** 2, 1e-8)
-            gain = snr / (snr + 1.0)
+                # 1. Neural DeepFilterNet3 ONNX inference
+                if self.sess_enc is not None and self.sess_erb is not None:
+                    try:
+                        erb_energy = np.matmul(psd, self._erb_fb)
+                        erb_db = 10.0 * np.log10(np.maximum(erb_energy, 1e-10))
+                        self._erb_state = erb_db * (1.0 - self._norm_alpha) + self._erb_state * self._norm_alpha
+                        norm_erb = ((erb_db - self._erb_state) / 40.0)[np.newaxis, np.newaxis, np.newaxis, :].astype(np.float32)
 
-            # Dereverberation pass (estimate late reflections from smoothed past spectral energy)
-            if do_dereverb:
-                reverb_decay = 0.82  # exponential reverberation decay factor
-                self._reverb_est = np.maximum(self._reverb_est * reverb_decay, mag * 0.28)
-                reverb_ratio = (self._reverb_est ** 2) / np.maximum(mag ** 2 + 1e-8, 1e-8)
-                dereverb_gain = np.clip(1.0 - reverb_ratio * 0.65, 0.2, 1.0)
-                gain = gain * dereverb_gain
+                        spec_mag = np.abs(spec[:96])
+                        self._spec_state = np.sqrt(spec_mag * (1.0 - self._norm_alpha) + (self._spec_state ** 2) * self._norm_alpha)
+                        norm_real = spec[:96].real / np.maximum(self._spec_state, 1e-6)
+                        norm_imag = spec[:96].imag / np.maximum(self._spec_state, 1e-6)
+                        feat_spec = np.stack([norm_real, norm_imag], axis=0)[np.newaxis, :, np.newaxis, :].astype(np.float32)
 
-            # Apply user attenuation limit (prevents total silence gating artifacts)
-            gain = np.clip(gain, min_gain, 1.0)
+                        e0, e1, e2, e3, emb, c0, lsnr = self.sess_enc.run(
+                            None, {"feat_erb": norm_erb, "feat_spec": feat_spec}
+                        )
+                        m = self.sess_erb.run(None, {"emb": emb, "e3": e3, "e2": e2, "e1": e1, "e0": e0})[0]
+                        erb_mask = np.clip(m[0, 0, 0, :], 0.0, 1.0)
+                        gain = np.matmul(erb_mask, self._inv_erb)
+                    except Exception:
+                        gain = None
 
-            # Apply wet/dry mix to spectral gains
-            gain = (1.0 - wet) + wet * gain
+                # 2. Decision-Directed Ephraim-Malah / VAD engine (fallback or standalone)
+                if gain is None:
+                    post_snr = np.maximum(psd / np.maximum(self._noise_psd, 1e-9), 1e-4)
+                    prior_snr = 0.94 * (self._prior_speech / np.maximum(self._noise_psd, 1e-9)) + 0.06 * np.maximum(
+                        post_snr - 1.0, 0.0
+                    )
+                    prior_snr = np.maximum(prior_snr, 1e-4)
 
-            # Synthesize enhanced frame
+                    mean_vocal_snr = np.mean(post_snr[4:70])
+                    is_speaking = mean_vocal_snr > 3.0
+
+                    if not is_speaking:
+                        self._noise_psd = 0.92 * self._noise_psd + 0.08 * psd
+                    else:
+                        quiet_bins = post_snr < 1.8
+                        self._noise_psd = np.where(quiet_bins, 0.98 * self._noise_psd + 0.02 * psd, self._noise_psd)
+
+                    gain = np.maximum(1.0 - 2.2 / np.maximum(post_snr, 1.0), 0.0)
+                    gain = np.sqrt(gain)
+
+                # 3. Acoustic dereverberation
+                if do_dereverb:
+                    self._reverb_tail = 0.82 * self._reverb_tail + 0.18 * (mag * gain)
+                    rev_ratio = (0.35 * self._reverb_tail) / np.maximum(mag, 1e-8)
+                    gain = gain * np.clip(1.0 - rev_ratio, 0.35, 1.0)
+
+                # 4. Multi-band frequency smoothing across neighboring bins
+                gain = np.convolve(gain, np.array([0.15, 0.70, 0.15], dtype=np.float32), mode="same")
+                gain = np.clip(gain, min_gain, 1.0)
+
+                if wet < 0.999:
+                    gain = (1.0 - wet) + wet * gain
+
+                self._prior_speech = (mag * gain) ** 2
+
             enhanced_spec = (mag * gain) * np.exp(1j * phase)
             enhanced_frame = np.fft.irfft(enhanced_spec, n=n_fft).real.astype(np.float32) * win
 
-            # Overlap-add
             self._out_buffer += enhanced_frame
             out[pos : pos + hop] = self._out_buffer[:hop]
             self._out_buffer[:-hop] = self._out_buffer[hop:]
@@ -211,9 +291,7 @@ class ClarityEngine:
 
             pos += hop
 
-        # Output remaining samples if chunk is not an exact multiple of hop
         if pos < len(samples):
-            rem = len(samples) - pos
             out[pos:] = samples[pos:] * (1.0 - wet * 0.5)
 
         return out.astype(np.float32)
@@ -226,7 +304,7 @@ class ClarityEngine:
         dereverb: bool = True,
         progress_cb: Callable[[float], None] | None = None,
     ) -> None:
-        """Enhance an audio file and write the de-noised, de-reverberated audio to output_path."""
+        """Enhance an audio file and write the de-noised vocal audio to output_path."""
         import pedalboard.io
 
         with pedalboard.io.AudioFile(input_path) as fin:
@@ -234,7 +312,6 @@ class ClarityEngine:
             channels = fin.num_channels
             audio = fin.read(fin.frames)
 
-        # Convert to 48kHz mono for processing
         mono = np.mean(audio, axis=0) if channels > 1 else audio[0]
         if sr != self.SAMPLE_RATE:
             resampler = pedalboard.io.StreamResampler(sr, self.SAMPLE_RATE, 1)
@@ -242,9 +319,9 @@ class ClarityEngine:
         else:
             mono_48k = mono
 
-        # Chunk processing for progress updates
-        block_size = 4800  # 100 ms chunks
-        enhanced_chunks = []
+        self.reset()
+        block_size = 4800
+        enhanced_chunks: list[np.ndarray] = []
         total_len = len(mono_48k)
         for i in range(0, total_len, block_size):
             block = mono_48k[i : i + block_size]
@@ -254,8 +331,6 @@ class ClarityEngine:
                 progress_cb(min(1.0, (i + len(block)) / float(total_len)))
 
         cleaned_full = np.concatenate(enhanced_chunks)
-
-        # Resample back to original sample rate if necessary
         if sr != self.SAMPLE_RATE:
             up_resampler = pedalboard.io.StreamResampler(self.SAMPLE_RATE, sr, 1)
             out_audio = up_resampler.process(cleaned_full.reshape(1, -1))
