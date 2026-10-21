@@ -9,6 +9,8 @@ from typing import Callable
 
 import numpy as np
 
+from .dfn3 import DFN3Stream, find_weights_dir
+
 
 @dataclass
 class HardwareInfo:
@@ -70,8 +72,8 @@ class ClarityEngine:
     """DeepFilterNet3 neural voice cleaner and dereverberation processor.
 
     Operates at 48 kHz with 960-sample STFT (20 ms) and 480-sample hop (10 ms).
-    Uses periodic square-root Hann window for exact Constant Overlap-Add (COLA)
-    with zero amplitude modulation or buzzing distortion.
+    Uses DeepFilterNet3 (`DFN3Stream`) when ONNX weights are available, with a
+    COLA spectral fallback otherwise.
     """
 
     FRAME_SIZE: int = 960       # 20 ms at 48 kHz
@@ -83,7 +85,7 @@ class ClarityEngine:
         self,
         sample_rate: int = 48000,
         model_dir: str | None = None,
-        atten_limit_db: float = 35.0,
+        atten_limit_db: float = 100.0,
         dereverb: bool = True,
     ):
         self.sample_rate = sample_rate
@@ -91,10 +93,9 @@ class ClarityEngine:
         self.dereverb = dereverb
         self.model_dir = model_dir or self._default_weights_dir()
 
-        self.sess_enc = None
-        self.sess_erb = None
+        self._dfn3: DFN3Stream | None = None
 
-        # Exact COLA periodic sqrt-Hann window
+        # Exact COLA periodic sqrt-Hann window for fallback path
         n = np.arange(self.FRAME_SIZE, dtype=np.float32)
         hann = 0.5 * (1.0 - np.cos(2.0 * np.pi * n / self.FRAME_SIZE))
         self._window = np.sqrt(np.maximum(hann, 0.0)).astype(np.float32)
@@ -106,14 +107,8 @@ class ClarityEngine:
         self._noise_psd = np.ones(n_bins, dtype=np.float32) * 1e-4
         self._prior_speech = np.zeros(n_bins, dtype=np.float32)
         self._reverb_tail = np.zeros(n_bins, dtype=np.float32)
-
-        # Normalization states for DeepFilterNet3
-        self._erb_state = np.linspace(-60.0, -90.0, self.NUM_ERB, dtype=np.float32)
-        self._spec_state = np.linspace(0.001, 0.0001, 96, dtype=np.float32)
-        self._norm_alpha = 0.95
         self._calibrated_frames = 0
 
-        self._erb_fb, self._inv_erb = self._build_erb_filterbank(self.sample_rate, self.FRAME_SIZE, self.NUM_ERB)
         self._init_neural_models()
 
     @staticmethod
@@ -122,65 +117,22 @@ class ClarityEngine:
 
     def _init_neural_models(self) -> None:
         """Attempt to load DeepFilterNet3 ONNX models if available."""
-        if not self.model_dir or not os.path.isdir(self.model_dir):
-            return
-
-        enc_path = os.path.join(self.model_dir, "enc.onnx")
-        erb_path = os.path.join(self.model_dir, "erb_dec.onnx")
-
-        if os.path.isfile(enc_path) and os.path.isfile(erb_path):
+        wdir = find_weights_dir([self.model_dir]) if self.model_dir else None
+        if wdir is not None:
             try:
-                import onnxruntime as ort
-                providers = ort.get_available_providers()
-                active = [p for p in ["CUDAExecutionProvider", "DmlExecutionProvider", "CPUExecutionProvider"] if p in providers]
-                opts = ort.SessionOptions()
-                opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-                self.sess_enc = ort.InferenceSession(enc_path, sess_options=opts, providers=active)
-                self.sess_erb = ort.InferenceSession(erb_path, sess_options=opts, providers=active)
+                self._dfn3 = DFN3Stream(wdir)
             except Exception:
-                self.sess_enc = None
-                self.sess_erb = None
-
-    @staticmethod
-    def _build_erb_filterbank(sr: int, n_fft: int, nb_erb: int) -> tuple[np.ndarray, np.ndarray]:
-        """Construct forward and inverse ERB filterbanks for 48 kHz audio."""
-        n_bins = n_fft // 2 + 1
-        erb_low = 9.265 * math.log(1.0 + 20.0 / (24.7 * 9.265))
-        erb_high = 9.265 * math.log(1.0 + (sr / 2.0) / (24.7 * 9.265))
-        step = (erb_high - erb_low) / nb_erb
-        freq_width = sr / n_fft
-
-        widths: list[int] = []
-        prev_f = 0
-        for i in range(1, nb_erb + 1):
-            f = 24.7 * 9.265 * (math.exp((erb_low + i * step) / 9.265) - 1.0)
-            fb = int(round(f / freq_width))
-            w = max(1, fb - prev_f)
-            widths.append(w)
-            prev_f = fb
-
-        diff = sum(widths) - n_bins
-        widths[-1] -= diff
-
-        erb_fb = np.zeros((n_bins, nb_erb), dtype=np.float32)
-        inv_erb = np.zeros((nb_erb, n_bins), dtype=np.float32)
-        idx = 0
-        for b, w in enumerate(widths):
-            erb_fb[idx : idx + w, b] = 1.0 / max(1, w)
-            inv_erb[b, idx : idx + w] = 1.0
-            idx += w
-
-        return erb_fb, inv_erb
+                self._dfn3 = None
 
     def reset(self) -> None:
         """Clear buffers and reset filter tracking state."""
+        if self._dfn3 is not None:
+            self._dfn3.reset()
         self._in_buffer.fill(0.0)
         self._out_buffer.fill(0.0)
         self._noise_psd.fill(1e-4)
         self._prior_speech.fill(0.0)
         self._reverb_tail.fill(0.0)
-        self._erb_state = np.linspace(-60.0, -90.0, self.NUM_ERB, dtype=np.float32)
-        self._spec_state = np.linspace(0.001, 0.0001, 96, dtype=np.float32)
         self._calibrated_frames = 0
 
     def process_chunk(
@@ -190,7 +142,7 @@ class ClarityEngine:
         atten_limit_db: float | None = None,
         dereverb: bool | None = None,
     ) -> np.ndarray:
-        """Process 1D float32 audio block with DeepFilterNet spectral enhancement."""
+        """Process 1D float32 audio block with DeepFilterNet3 spectral enhancement."""
         if len(chunk) == 0 or wet <= 0.001:
             return chunk
 
@@ -206,54 +158,32 @@ class ClarityEngine:
         win = self._window
         n_fft = self.FRAME_SIZE
 
-        while pos + hop <= len(samples):
-            self._in_buffer[:-hop] = self._in_buffer[hop:]
-            self._in_buffer[-hop:] = samples[pos : pos + hop]
+        if self._dfn3 is not None:
+            while pos + hop <= len(samples):
+                out[pos : pos + hop] = self._dfn3.process_hop(
+                    samples[pos : pos + hop],
+                    atten_limit_db=atten_lim,
+                    wet=wet,
+                    pf=do_dereverb,
+                )
+                pos += hop
+        else:
+            while pos + hop <= len(samples):
+                self._in_buffer[:-hop] = self._in_buffer[hop:]
+                self._in_buffer[-hop:] = samples[pos : pos + hop]
 
-            frame = self._in_buffer * win
-            spec = np.fft.rfft(frame)
-            mag = np.abs(spec)
-            psd = mag ** 2
-            phase = np.angle(spec)
+                frame = self._in_buffer * win
+                spec = np.fft.rfft(frame)
+                mag = np.abs(spec)
+                psd = mag ** 2
+                phase = np.angle(spec)
 
-            self._calibrated_frames += 1
-            if self._calibrated_frames < 20:
-                self._noise_psd = 0.8 * self._noise_psd + 0.2 * psd
-                gain = np.ones_like(mag) * min_gain
-            else:
-                gain = None
-
-                # 1. Neural DeepFilterNet3 ONNX inference
-                if self.sess_enc is not None and self.sess_erb is not None:
-                    try:
-                        erb_energy = np.matmul(psd, self._erb_fb)
-                        erb_db = 10.0 * np.log10(np.maximum(erb_energy, 1e-10))
-                        self._erb_state = erb_db * (1.0 - self._norm_alpha) + self._erb_state * self._norm_alpha
-                        norm_erb = ((erb_db - self._erb_state) / 40.0)[np.newaxis, np.newaxis, np.newaxis, :].astype(np.float32)
-
-                        spec_mag = np.abs(spec[:96])
-                        self._spec_state = np.sqrt(spec_mag * (1.0 - self._norm_alpha) + (self._spec_state ** 2) * self._norm_alpha)
-                        norm_real = spec[:96].real / np.maximum(self._spec_state, 1e-6)
-                        norm_imag = spec[:96].imag / np.maximum(self._spec_state, 1e-6)
-                        feat_spec = np.stack([norm_real, norm_imag], axis=0)[np.newaxis, :, np.newaxis, :].astype(np.float32)
-
-                        e0, e1, e2, e3, emb, c0, lsnr = self.sess_enc.run(
-                            None, {"feat_erb": norm_erb, "feat_spec": feat_spec}
-                        )
-                        m = self.sess_erb.run(None, {"emb": emb, "e3": e3, "e2": e2, "e1": e1, "e0": e0})[0]
-                        erb_mask = np.clip(m[0, 0, 0, :], 0.0, 1.0)
-                        gain = np.matmul(erb_mask, self._inv_erb)
-                    except Exception:
-                        gain = None
-
-                # 2. Decision-Directed Ephraim-Malah / VAD engine (fallback or standalone)
-                if gain is None:
+                self._calibrated_frames += 1
+                if self._calibrated_frames < 20:
+                    self._noise_psd = 0.8 * self._noise_psd + 0.2 * psd
+                    gain = np.ones_like(mag) * min_gain
+                else:
                     post_snr = np.maximum(psd / np.maximum(self._noise_psd, 1e-9), 1e-4)
-                    prior_snr = 0.94 * (self._prior_speech / np.maximum(self._noise_psd, 1e-9)) + 0.06 * np.maximum(
-                        post_snr - 1.0, 0.0
-                    )
-                    prior_snr = np.maximum(prior_snr, 1e-4)
-
                     mean_vocal_snr = np.mean(post_snr[4:70])
                     is_speaking = mean_vocal_snr > 3.0
 
@@ -263,33 +193,30 @@ class ClarityEngine:
                         quiet_bins = post_snr < 1.8
                         self._noise_psd = np.where(quiet_bins, 0.98 * self._noise_psd + 0.02 * psd, self._noise_psd)
 
-                    gain = np.maximum(1.0 - 2.2 / np.maximum(post_snr, 1.0), 0.0)
-                    gain = np.sqrt(gain)
+                    gain = np.sqrt(np.maximum(1.0 - 2.2 / np.maximum(post_snr, 1.0), 0.0))
 
-                # 3. Acoustic dereverberation
-                if do_dereverb:
-                    self._reverb_tail = 0.82 * self._reverb_tail + 0.18 * (mag * gain)
-                    rev_ratio = (0.35 * self._reverb_tail) / np.maximum(mag, 1e-8)
-                    gain = gain * np.clip(1.0 - rev_ratio, 0.35, 1.0)
+                    if do_dereverb:
+                        self._reverb_tail = 0.82 * self._reverb_tail + 0.18 * (mag * gain)
+                        rev_ratio = (0.35 * self._reverb_tail) / np.maximum(mag, 1e-8)
+                        gain = gain * np.clip(1.0 - rev_ratio, 0.35, 1.0)
 
-                # 4. Multi-band frequency smoothing across neighboring bins
-                gain = np.convolve(gain, np.array([0.15, 0.70, 0.15], dtype=np.float32), mode="same")
-                gain = np.clip(gain, min_gain, 1.0)
+                    gain = np.convolve(gain, np.array([0.15, 0.70, 0.15], dtype=np.float32), mode="same")
+                    gain = np.clip(gain, min_gain, 1.0)
 
-                if wet < 0.999:
-                    gain = (1.0 - wet) + wet * gain
+                    if wet < 0.999:
+                        gain = (1.0 - wet) + wet * gain
 
-                self._prior_speech = (mag * gain) ** 2
+                    self._prior_speech = (mag * gain) ** 2
 
-            enhanced_spec = (mag * gain) * np.exp(1j * phase)
-            enhanced_frame = np.fft.irfft(enhanced_spec, n=n_fft).real.astype(np.float32) * win
+                enhanced_spec = (mag * gain) * np.exp(1j * phase)
+                enhanced_frame = np.fft.irfft(enhanced_spec, n=n_fft).real.astype(np.float32) * win
 
-            self._out_buffer += enhanced_frame
-            out[pos : pos + hop] = self._out_buffer[:hop]
-            self._out_buffer[:-hop] = self._out_buffer[hop:]
-            self._out_buffer[-hop:] = 0.0
+                self._out_buffer += enhanced_frame
+                out[pos : pos + hop] = self._out_buffer[:hop]
+                self._out_buffer[:-hop] = self._out_buffer[hop:]
+                self._out_buffer[-hop:] = 0.0
 
-            pos += hop
+                pos += hop
 
         if pos < len(samples):
             out[pos:] = samples[pos:] * (1.0 - wet * 0.5)
@@ -300,7 +227,7 @@ class ClarityEngine:
         self,
         input_path: str,
         output_path: str,
-        atten_limit_db: float = 35.0,
+        atten_limit_db: float = 100.0,
         dereverb: bool = True,
         progress_cb: Callable[[float], None] | None = None,
     ) -> None:
